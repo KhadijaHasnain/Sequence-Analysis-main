@@ -1,0 +1,741 @@
+!pip install wandb
+import os
+import time
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+from torchvision import transforms
+from PIL import Image, ImageFile
+from collections import Counter
+from tqdm import tqdm
+import matplotlib.pyplot as plt
+import matplotlib.patches as patches
+import wandb  # Import wandb
+import torchvision.transforms as transforms
+
+# Define configuration for YOLOv3
+config = [
+    (32, 3, 1),
+    (128, 3, 1),
+    (64, 3, 2),
+    ["list", 1],
+    (128, 3, 2),
+    ["list", 2],
+    (256, 3, 2),
+    ["list", 8],
+    (512, 3, 2),
+    ["list", 8],
+    (1024, 3, 2),
+    ["list", 4],
+    (512, 1, 1),
+    (1024, 3, 1),
+    "sp",
+    (256, 1, 1),
+    "up",
+    (256, 1, 1),
+    (512, 3, 1),
+    "sp",
+    (128, 1, 1),
+    "up",
+    (128, 1, 1),
+    (256, 3, 1),
+    "sp",
+]
+
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+model = YOLOv3(ClassesNo=ClassesNo)
+x = torch.randn((2, 3, ImageSize, ImageSize))
+
+WorkersNo = 4
+SizeOfBatch = 32
+ImageSize = 416
+ClassesNo = 20
+RateOfLearning = 1e-5
+epochsno = 150
+ThresholdConf = 0.8
+ThreshMap = 0.5
+ThreshNms = 0.45
+sp = [ImageSize // 32, ImageSize // 16, ImageSize // 8]
+
+DirImage = "/kaggle/input/pascalvoc-yolo/images"
+DirLable = "/kaggle/input/pascalvoc-yolo/labels"
+
+ANCHORS = [
+    [(0.28, 0.22), (0.38, 0.48), (0.9, 0.78)],
+    [(0.07, 0.15), (0.15, 0.11), (0.14, 0.29)],
+    [(0.02, 0.03), (0.04, 0.07), (0.08, 0.06)],
+]
+
+AllClacess = [
+    "aeroplane",
+    "bicycle",
+    "bird",
+    "boat",
+    "bottle",
+    "bus",
+    "car",
+    "cat",
+    "chair",
+    "cow",
+    "diningtable",
+    "dog",
+    "horse",
+    "motorbike",
+    "person",
+    "pottedplant",
+    "sheep",
+    "sofa",
+    "train",
+    "tvmonitor"
+]
+
+# allows PIL to load images even if they are truncated or incomplete
+ImageFile.LOAD_TRUNCATED_IMAGES = True
+
+class YOLODataset(Dataset):
+  def __init__(self, csv_file, ImgDir, LableDir, anchors,
+               ImageSize=416, sp=[13,26,52], cp=20, transform=None):
+    self.annotations = pd.read_csv(csv_file)
+    self.ImgDir = ImgDir
+    self.LableDir = LableDir
+    self.transform = transform
+    self.sp = sp
+    self.anchors = torch.tensor(anchors[0] + anchors[1] + anchors[2]) # For all 3 scales
+    self.num_anchors = self.anchors.shape[0]
+    self.num_anchors_per_scale = self.num_anchors // 3
+    self.cp = cp
+    self.ignore_iou_thresh = 0.5
+
+  def __len__(self):
+    return len(self.annotations)
+
+  def __getitem__(self, index):
+    label_path = os.path.join(self.LableDir, self.annotations.iloc[index, 1])
+    boxx = np.roll(np.loadtxt(fname=label_path, delimiter=" ", ndmin=2), 4, axis=1).tolist() # np.roll with shift 4 on axis 1: [class, x, y, w, h] --> [x, y, w, h, class]
+
+    img_path = os.path.join(self.ImgDir, self.annotations.iloc[index, 0])
+    image = Image.open(img_path)
+
+    if self.transform:
+      image = self.transform(image)
+
+    targets = [torch.zeros((self.num_anchors // 3, sp, sp, 6)) for sp in self.sp] # 6 because objectness score, bounding box coordinates (x, y, w, h), class label
+
+    for box in boxx:
+      iou_anchors = WeidthHeight(torch.tensor(box[2:4]), self.anchors) # IOU from height and width
+      anchor_indices = iou_anchors.argsort(descending=True, dim=0) # Sorting sucht that the first is the best anchor
+
+      x, y, width, height, class_label = box
+      has_anchor = [False, False, False] # Make sure there is an anchor for each of three scales for each bounding box
+
+      for anchor_idx in anchor_indices:
+        scale_idx = anchor_idx // self.num_anchors_per_scale # scale_idx is either 0,1,2: 0-->13x13, 1:-->26x26, 2:-->52x52
+        anchor_on_scale = anchor_idx % self.num_anchors_per_scale # In each scale, choosing the anchor thats either 0,1,2
+
+        sp = self.sp[scale_idx]
+        i, j = int(sp*y), int(sp*x) # x=0.5, sp=13 --> int(6.5) = 6 | i=y cell, j=x cell
+        anchor_taken = targets[scale_idx][anchor_on_scale, i, j, 0]
+
+        if not anchor_taken and not has_anchor[scale_idx]:
+          targets[scale_idx][anchor_on_scale, i, j, 0] = 1
+          x_cell, y_cell = sp*x - j, sp*y - i # 6.5 - 6 = 0.5 such that they are between [0,1]
+          width_cell, height_cell = (
+              width*sp, # sp=13, width=0.5, 6.5
+              height*sp
+          )
+
+          box_coordinates = torch.tensor([x_cell, y_cell, width_cell, height_cell])
+
+          targets[scale_idx][anchor_on_scale, i, j, 1:5] = box_coordinates
+          targets[scale_idx][anchor_on_scale, i, j, 5] = int(class_label)
+          has_anchor[scale_idx] = True
+
+        # Even if the same grid shares another anchor having iou>ignore_iou_thresh then,
+        elif not anchor_taken and iou_anchors[anchor_idx] > self.ignore_iou_thresh:
+          targets[scale_idx][anchor_on_scale, i, j, 0] = -1 # ignore this prediction
+
+    return image, tuple(targets)
+  
+transform = transforms.Compose([transforms.Resize((416, 416)), transforms.ToTensor()])
+
+def get_loaders(train_csv_path, test_csv_path):
+
+    train_dataset = YOLODataset(
+        train_csv_path,
+        transform=transform,
+        sp=[ImageSize // 32, ImageSize // 16, ImageSize // 8],
+        ImgDir=DirImage,
+        LableDir=DirLable,
+        anchors=ANCHORS,
+    )
+    test_dataset = YOLODataset(
+        test_csv_path,
+        transform=transform,
+        sp=[ImageSize // 32, ImageSize // 16, ImageSize // 8],
+        ImgDir=DirImage,
+        LableDir=DirLable,
+        anchors=ANCHORS,
+    )
+    train_loader = DataLoader(
+        dataset=train_dataset,
+        batch_size=SizeOfBatch,
+        shuffle=True,
+        drop_last=False,
+    )
+    test_loader = DataLoader(
+        dataset=test_dataset,
+        batch_size=SizeOfBatch,
+        shuffle=False,
+        drop_last=False,
+    )
+
+    return train_loader, test_loader
+
+# Define CNN block
+class CNN_Block(nn.Module):
+    def __init__(self, in_channels, out_channels, bn_act=True, **kwargs):
+        super(CNN_Block, self).__init__()
+        self.conv = nn.Conv2d(in_channels, out_channels, bias=not bn_act, **kwargs)
+        self.bn = nn.BatchNorm2d(out_channels)
+        self.leaky = nn.LeakyReLU(0.1)
+        self.use_bn_act = bn_act
+
+    def forward(self, x):
+        if self.use_bn_act:
+            return self.leaky(self.bn(self.conv(x)))
+        else:
+            return self.conv(x)
+
+# Define Residual block
+class Residual_Block(nn.Module):
+    def __init__(self, channels, use_residual=True, num_repeats=1):
+        super(Residual_Block, self).__init__()
+        self.layers = nn.ModuleList()
+
+        for repeat in range(num_repeats):
+            self.layers += [
+                nn.Sequential(
+                    CNN_Block(channels, channels//2, kernel_size=1),
+                    CNN_Block(channels//2, channels, kernel_size=3, padding=1)
+                )
+            ]
+
+        self.use_residual = use_residual
+        self.num_repeats = num_repeats
+
+    def forward(self, x):
+        for layer in self.layers:
+            if self.use_residual:
+                x = x + layer(x)
+            else:
+                x = layer(x)
+
+        return x
+
+# Define Prediction Scale
+class Prediction_Scale(nn.Module):
+    def __init__(self, in_channels, ClassesNo):
+        super(Prediction_Scale, self).__init__()
+        self.pred = nn.Sequential(
+            CNN_Block(in_channels, 2 * in_channels, kernel_size=3, padding=1),
+            CNN_Block(2 * in_channels, (ClassesNo + 5) * 3, bn_act=False, kernel_size=1),
+        )
+        self.ClassesNo = ClassesNo
+
+    def forward(self, x):
+        return (
+            self.pred(x)
+            .reshape(x.shape[0], 3, self.ClassesNo + 5, x.shape[2], x.shape[3])
+            .permute(0, 1, 3, 4, 2)
+        )
+
+class YOLOv3(nn.Module):
+  def __init__(self, in_channels=3, ClassesNo=20):
+    super(YOLOv3, self).__init__()
+    self.ClassesNo = ClassesNo
+    self.in_channels = in_channels
+    self.layers = self._create_conv_layers()
+
+  def forward(self, x):
+    outputs = []
+    route_connections = []
+
+    for layer in self.layers:
+      if isinstance(layer, Prediction_Scale):
+        outputs.append(layer(x))
+        continue
+
+      x = layer(x)
+
+      if isinstance(layer, Residual_Block) and layer.num_repeats == 8:
+        route_connections.append(x)
+
+      elif isinstance(layer, nn.Upsample):
+        x = torch.cat([x, route_connections[-1]], dim=1)
+        route_connections.pop()
+
+    return outputs
+
+  def _create_conv_layers(self):
+    layers = nn.ModuleList()
+    in_channels = self.in_channels
+
+    for module in config:
+      if isinstance(module, tuple):
+        out_channels, kernel_size, stride = module
+        layers.append(CNN_Block(
+            in_channels,
+            out_channels,
+            kernel_size=kernel_size,
+            stride=stride,
+            padding=1 if kernel_size == 3 else 0
+        ))
+        in_channels = out_channels
+
+      elif isinstance(module, list):
+        num_repeats = module[1]
+        layers.append(Residual_Block(in_channels, num_repeats=num_repeats))
+
+      elif isinstance(module, str):
+        if module == "sp":
+          layers += [
+              Residual_Block(in_channels, use_residual=False, num_repeats=1),
+              CNN_Block(in_channels, in_channels//2, kernel_size=1),
+              Prediction_Scale(in_channels//2, ClassesNo = self.ClassesNo)
+          ]
+          in_channels = in_channels // 2
+
+        elif module == "up":
+          layers.append(nn.Upsample(scale_factor=2))
+          in_channels = in_channels * 3
+
+    return layers
+
+# Define utility functions
+def WeidthHeight(boxa, boxb):
+    intersection = torch.min(boxa[..., 0], boxb[..., 0]) * torch.min(
+        boxa[..., 1], boxb[..., 1]
+    )
+    union = (
+        boxa[..., 0] * boxa[..., 1] + boxb[..., 0] * boxb[..., 1] - intersection
+    )
+    return intersection / union
+
+def non_max_suppression(boxx, iou_threshold, threshold, box_format="corners"):
+    assert type(boxx) == list
+
+    boxx = [box for box in boxx if box[1] > threshold]
+    boxx = sorted(boxx, key=lambda x: x[1], reverse=True)
+    boxx_after_nms = []
+
+    while boxx:
+        chosen_box = boxx.pop(0)
+
+        boxx = [
+            box
+            for box in boxx
+            if box[0] != chosen_box[0]
+            or InterctionOverUnion(
+                torch.tensor(chosen_box[2:]),
+                torch.tensor(box[2:]),
+                box_format=box_format,
+            )
+            < iou_threshold
+        ]
+
+        boxx_after_nms.append(chosen_box)
+
+    return boxx_after_nms
+
+def InterctionOverUnion(PredsBox, lableBox, box_format="midpoint"):
+    if box_format == "midpoint":
+        box1_a1 = PredsBox[..., 0:1] - PredsBox[..., 2:3] / 2
+        box1_b1 = PredsBox[..., 1:2] - PredsBox[..., 3:4] / 2
+        box1_a2 = PredsBox[..., 0:1] + PredsBox[..., 2:3] / 2
+        box1_b2 = PredsBox[..., 1:2] + PredsBox[..., 3:4] / 2
+        box2_a1 = lableBox[..., 0:1] - lableBox[..., 2:3] / 2
+        box2_y1 = lableBox[..., 1:2] - lableBox[..., 3:4] / 2
+        box2_a2 = lableBox[..., 0:1] + lableBox[..., 2:3] / 2
+        box2_y2 = lableBox[..., 1:2] + lableBox[..., 3:4] / 2
+
+    if box_format == "corners":
+        box1_a1 = PredsBox[..., 0:1]
+        box1_b1 = PredsBox[..., 1:2]
+        box1_a2 = PredsBox[..., 2:3]
+        box1_b2 = PredsBox[..., 3:4]
+        box2_a1 = lableBox[..., 0:1]
+        box2_y1 = lableBox[..., 1:2]
+        box2_a2 = lableBox[..., 2:3]
+        box2_y2 = lableBox[..., 3:4]
+
+    x1 = torch.max(box1_a1, box2_a1)
+    y1 = torch.max(box1_b1, box2_y1)
+    x2 = torch.min(box1_a2, box2_a2)
+    y2 = torch.min(box1_b2, box2_y2)
+    intersection = torch.clamp(x2 - x1, min=0) * torch.clamp(y2 - y1, min=0)
+    box1_area = (box1_a2 - box1_a1) * (box1_b2 - box1_b1)
+    box2_area = (box2_a2 - box2_a1) * (box2_y2 - box2_y1)
+    iou = intersection / (box1_area + box2_area - intersection)
+
+    return iou
+
+///////////////////////////////////////////////////////
+def mean_average_precision(
+    pred_boxes, true_boxes, iou_threshold=0.5, box_format="midpoint", ClassesNo=4
+):
+    # list storing all AP for respective classes
+    average_precisions = []
+
+    # used for numerical stability later on
+    epsilon = 1e-6
+
+    for c in range(ClassesNo):
+        detections = []
+        ground_truths = []
+
+        for detection in pred_boxes:
+            if detection[1] == c:
+                detections.append(detection)
+
+        for true_box in true_boxes:
+            if true_box[1] == c:
+                ground_truths.append(true_box)
+
+        amount_boxx = Counter([gt[0] for gt in ground_truths])
+
+        for key, val in amount_boxx.items():
+            amount_boxx[key] = torch.zeros(val)
+
+        # sort by box probabilities which is index 2
+        detections.sort(key=lambda x: x[2], reverse=True)
+        TP = torch.zeros((len(detections)))
+        FP = torch.zeros((len(detections)))
+        total_true_boxx = len(ground_truths)
+
+        # If none exists for this class then we can safely skip
+        if total_true_boxx == 0:
+            continue
+
+        for detection_idx, detection in enumerate(detections):
+            ground_truth_img = [
+                bbox for bbox in ground_truths if bbox[0] == detection[0]
+            ]
+
+            num_gts = len(ground_truth_img)
+            best_iou = 0
+
+            for idx, gt in enumerate(ground_truth_img):
+                iou = InterctionOverUnion(
+                    torch.tensor(detection[3:]),
+                    torch.tensor(gt[3:]),
+                    box_format=box_format,
+                )
+
+                if iou > best_iou:
+                    best_iou = iou
+                    best_gt_idx = idx
+
+            if best_iou > iou_threshold:
+                # only detect ground truth detection once
+                if amount_boxx[detection[0]][best_gt_idx] == 0:
+                    # true positive and add this bounding box to seen
+                    TP[detection_idx] = 1
+                    amount_boxx[detection[0]][best_gt_idx] = 1
+                else:
+                    FP[detection_idx] = 1
+
+            # if IOU is lower then the detection is a false positive
+            else:
+                FP[detection_idx] = 1
+
+        TP_cumsum = torch.cumsum(TP, dim=0)
+        FP_cumsum = torch.cumsum(FP, dim=0)
+        recalls = TP_cumsum / (total_true_boxx + epsilon)
+        precisions = TP_cumsum / (TP_cumsum + FP_cumsum + epsilon)
+        precisions = torch.cat((torch.tensor([1]), precisions))
+        recalls = torch.cat((torch.tensor([0]), recalls))
+        # torch.trapz for numerical integration
+        average_precisions.append(torch.trapz(precisions, recalls))
+
+    return sum(average_precisions) / len(average_precisions)
+
+def compute_metrics(pred_boxes, true_boxes, iou_threshold=0.5):
+    # Your implementation for computing precision, recall, and f1
+    pred_classes = [box[0] for box in pred_boxes]
+    pred_iou = [box[1] for box in pred_boxes]
+    
+    tp, fp, fn = 0, 0, 0
+    
+    for pred, iou in zip(pred_classes, pred_iou):
+        if iou > iou_threshold:
+            tp += 1
+        else:
+            fp += 1
+    
+    true_classes = [box[0] for box in true_boxes]
+    for true in true_classes:
+        if not any(pred == true for pred in pred_classes):
+            fn += 1
+    
+    precision = tp / (tp + fp) if (tp + fp) > 0 else 0
+    recall = tp / (tp + fn) if (tp + fn) > 0 else 0
+    f1 = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0
+    
+    return precision, recall, f1
+
+def get_evaluation_boxx(
+    loader,
+    model,
+    iou_threshold,
+    anchors,
+    threshold,
+    box_format="midpoint"
+):
+
+    # make sure model is in eval before get boxx
+    model.eval()
+    train_idx = 0
+    all_pred_boxes = []
+    all_true_boxes = []
+    for batch_idx, (x, labels) in enumerate(loader):
+        x = x.float().to(DEVICE)
+
+        with torch.no_grad():
+            predictions = model(x)
+
+        batch_size = x.shape[0]
+        boxx = [[] for _ in range(batch_size)]
+        for i in range(3):
+            sp = predictions[i].shape[2] # grid cell size for each predictions
+            anchor = torch.tensor([*anchors[i]]).to(DEVICE) * sp # anchor for each grid, prediction type
+            boxes_scale_i = cells_to_boxx( # get boxx for each image in the batch
+                predictions[i], anchor, sp=sp, is_preds=True
+            )
+            for idx, (box) in enumerate(boxes_scale_i): # for each image, append the bbox to corr. boxx[idx]
+                boxx[idx] += box
+
+        # we just want one bbox for each label, not one for each scale
+        true_boxx = cells_to_boxx(
+            labels[2], anchor, sp=sp, is_preds=False
+        )
+
+        for idx in range(batch_size):
+            nms_boxes = non_max_suppression(
+                boxx[idx],
+                iou_threshold=iou_threshold,
+                threshold=threshold,
+                box_format=box_format,
+            )
+
+            for nms_box in nms_boxes:
+                all_pred_boxes.append([train_idx] + nms_box)
+
+            for box in true_boxx[idx]:
+                if box[1] > threshold:
+                    all_true_boxes.append([train_idx] + box)
+
+            # Apply non-max suppression
+            for i in range(len(preds)):
+                pred = preds[i]
+                preds[i] = non_max_suppression(
+                    pred.cpu().numpy(), iou_threshold, threshold
+                )
+
+            for i, pred in enumerate(preds):
+                all_pred_boxes.extend(pred)
+
+            for target in targets_batch:
+                target = target.cpu().numpy()
+                all_true_boxes.extend(target)
+                
+            precision, recall, f1 = compute_metrics(all_pred_boxes, all_true_boxes, iou_threshold)
+
+    model.train()
+    return all_pred_boxes, all_true_boxes
+
+def cells_to_boxx(predictions, anchors, sp, is_preds=True):
+
+    SizeOfBatch = predictions.shape[0]
+    num_anchors = len(anchors)
+    box_predictions = predictions[..., 1:5]
+    if is_preds:
+        anchors = anchors.reshape(1, len(anchors), 1, 1, 2)
+        box_predictions[..., 0:2] = torch.sigmoid(box_predictions[..., 0:2])
+        box_predictions[..., 2:] = torch.exp(box_predictions[..., 2:]) * anchors
+        scores = torch.sigmoid(predictions[..., 0:1])
+        best_class = torch.argmax(predictions[..., 5:], dim=-1).unsqueeze(-1)
+    else:
+        scores = predictions[..., 0:1]
+        best_class = predictions[..., 5:6]
+
+    cell_indices = (
+        torch.arange(sp)
+        .repeat(predictions.shape[0], 3, sp, 1)
+        .unsqueeze(-1)
+        .to(predictions.DEVICE)
+    )
+    x = 1 / sp * (box_predictions[..., 0:1] + cell_indices)
+    y = 1 / sp * (box_predictions[..., 1:2] + cell_indices.permute(0, 1, 3, 2, 4))
+    w_h = 1 / sp * box_predictions[..., 2:4]
+    converted_boxx = torch.cat((best_class, scores, x, y, w_h), dim=-1).reshape(SizeOfBatch, num_anchors * sp * sp, 6)
+    return converted_boxx.tolist()
+
+class YoloLoss(nn.Module):
+  def __init__(self):
+    super(YoloLoss, self).__init__()
+    self.mse = nn.MSELoss() # For bounding box loss
+    self.bce = nn.BCEWithLogitsLoss() # For multi-label prediction: Binary cross entropy
+    self.entropy = nn.CrossEntropyLoss() # For classification
+    self.sigmoid = nn.Sigmoid()
+
+    # Constants for significance of obj, or no obj.
+    self.lambda_class = 1
+    self.lambda_noobj = 10
+    self.lambda_obj = 1
+    self.lambda_box = 10
+
+  def forward(self, predictions, target, anchors):
+    obj = target[..., 0] == 1
+    noobj = target[..., 0] == 0
+
+    no_object_loss = self.bce(
+        (predictions[..., 0:1][noobj]), (target[..., 0:1][noobj])
+    )
+
+    anchors = anchors.reshape(1,3,1,1,2) # Anchors initial shape 3x2 --> 3 anchor boxes each of certain hxw (2)
+
+    # box_preds = [..., sigmoid(x), sigmoid(y), [p_w * exp(t_w)], [p_h * exp(t_h)], ...]
+    box_preds = torch.cat([self.sigmoid(predictions[..., 1:3]), torch.exp(predictions[..., 3:5]) * anchors], dim=-1)
+
+    # iou between predicted box and target box
+    ious = InterctionOverUnion(box_preds[obj], target[..., 1:5][obj]).detach()
+
+    object_loss = self.bce(
+        (predictions[..., 0:1][obj]), (ious * target[..., 0:1][obj]) # target * iou because only intersected part object loss calc
+    )
+
+    predictions[..., 1:3] = self.sigmoid(predictions[..., 1:3]) # x, y to be between [0,1]
+    target[..., 3:5] = torch.log(
+        (1e-6 + target[..., 3:5] / anchors)
+    ) # Exponential of hxw (taking log because opp. of exp)
+
+    box_loss = self.mse(predictions[..., 1:5][obj], target[..., 1:5][obj])
+
+    class_loss = self.entropy(
+        (predictions[..., 5:][obj]), (target[..., 5][obj].long())
+    )
+
+    loss = (
+        self.lambda_box * box_loss
+        + self.lambda_obj * object_loss
+        + self.lambda_noobj * no_object_loss
+        + self.lambda_class * class_loss
+    )
+
+    return loss
+
+/////////////////////////////////////////////////////////
+
+# Calculate precision, recall, and F1 score
+def calculate_metrics(pred_boxes, true_boxes, iou_threshold=0.5, num_classes=20):
+    TP = [0] * num_classes
+    FP = [0] * num_classes
+    FN = [0] * num_classes
+
+    for pred_box in pred_boxes:
+        pred_class = pred_box[0]
+        iou_max = 0
+        best_match = -1
+        for i, true_box in enumerate(true_boxes):
+            if pred_class == true_box[0]:
+                iou = InterctionOverUnion(torch.tensor(pred_box[1:]), torch.tensor(true_box[1:]))
+                if iou > iou_max:
+                    iou_max = iou
+                    best_match = i
+
+        if iou_max > iou_threshold:
+            TP[pred_class] += 1
+            true_boxes.pop(best_match)
+        else:
+            FP[pred_class] += 1
+
+    for true_box in true_boxes:
+        FN[true_box[0]] += 1
+
+    precision = [TP[i] / (TP[i] + FP[i] + 1e-6) for i in range(num_classes)]
+    recall = [TP[i] / (TP[i] + FN[i] + 1e-6) for i in range(num_classes)]
+    f1 = [2 * (precision[i] * recall[i]) / (precision[i] + recall[i] + 1e-6) for i in range(num_classes)]
+
+    return precision, recall, f1
+
+# Define the training loop
+def train_model(model, train_loader, optimizer, loss_fn, epochs):
+    scaler = torch.cuda.amp.GradScaler()
+
+    for epoch in range(epochs):
+        loop = tqdm(train_loader, leave=True)
+        for batch_idx, (data, targets) in enumerate(loop):
+            data = data.to(device)
+            targets = [target.to(device) for target in targets]
+
+            with torch.cuda.amp.autocast():
+                outputs = model(data)
+                loss = (
+                    loss_fn(outputs[0], targets[0])
+                    + loss_fn(outputs[1], targets[1])
+                    + loss_fn(outputs[2], targets[2])
+                )
+
+            optimizer.zero_grad()
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+
+            # Replace these with actual methods to extract predicted and true boxes
+            pred_boxes = extract_pred_boxes(outputs) 
+            true_boxes = extract_true_boxes(targets)
+
+            precision, recall, f1 = calculate_metrics(pred_boxes, true_boxes)
+
+            # Update progress bar
+            loop.set_postfix(loss=loss.item())
+
+            # Log metrics to wandb
+            wandb.log({
+                "loss": loss.item(),
+                "precision": np.mean(precision),
+                "recall": np.mean(recall),
+                "f1": np.mean(f1),
+            })
+
+        # Log the epoch number
+        wandb.log({"epoch": epoch})
+
+    print("Training completed.")
+
+# Example usage
+# Assuming `train_loader` is your DataLoader and `loss_fn` is your loss function
+optimizer = optim.Adam(model.parameters(), lr=0.001)
+epochs = 10
+
+# Configuring wandb
+wandb.init(project="your_project_name", entity="your_wandb_entity")
+wandb.config.update({
+    "learning_rate": 0.001,
+    "epochs": epochs,
+    "batch_size": train_loader.batch_size,
+})
+
+# Convert model to half precision
+model = model.to(device).half()
+
+# Train the model
+train_model(model, train_loader, optimizer, loss_fn, epochs)
+
+# Save the model
+torch.save(model.state_dict(), "yolov3_model.pth")
+wandb.save("yolov3_model.pth")  # Save model to wandb
+
